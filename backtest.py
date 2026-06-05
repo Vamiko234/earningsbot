@@ -28,7 +28,7 @@ try:
     from rich.console import Console
     _c = Console()
     def rprint(x=""):  _c.print(x)
-    def hr():          rprint("[bold cyan]" + "═" * 65 + "[/bold cyan]")
+    def hr():          rprint("[bold cyan]" + "=" * 65 + "[/bold cyan]")
     def section(t):    hr(); rprint(f"[bold cyan]  {t}[/bold cyan]"); hr()
 except ImportError:
     import re
@@ -55,7 +55,7 @@ BT = {
     "STARTING_CAP":    10_000,
     "SPEND_PER_TRADE": 500,
     "N_MC":            10_000,
-    "SCORE_SWEEP":     [50, 55, 60, 65, 70, 75, 80],
+    "SCORE_SWEEP":     [60, 65, 70, 75, 80, 85, 90],
     "RESULT_CSV":      "backtest_results.csv",
     # Expanding-window folds: (train_start, train_end, test_start, test_end)
     "WF_FOLDS": [
