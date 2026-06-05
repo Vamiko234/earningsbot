@@ -10,9 +10,22 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 import warnings; warnings.filterwarnings("ignore")
 
+# Load .env from the same directory as this file (keeps secrets out of CFG)
+try:
+    from dotenv import load_dotenv as _ld
+    _ld(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # python-dotenv optional — fall back to system env vars
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
+
+try:
+    import anthropic as _anthropic
+    HAS_CLAUDE = True
+except ImportError:
+    HAS_CLAUDE = False
 
 try:
     import ollama
@@ -46,8 +59,10 @@ CFG = {
     "ALPACA_SECRET": os.getenv("ALPACA_SECRET", ""),
     "PAPER":         True,          # always start on paper — flip to False for live
 
-    # Ollama
-    "OLLAMA_MODEL":  os.getenv("OLLAMA_MODEL", "llama3.1"),
+    # AI backend (Claude preferred, Ollama fallback)
+    "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
+    "CLAUDE_MODEL":      os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5"),
+    "OLLAMA_MODEL":      os.getenv("OLLAMA_MODEL", "llama3.1"),
 
     # Scanner window
     "DAYS_WINDOW":   7,             # look for earnings within next N days
@@ -329,49 +344,115 @@ def scan() -> List[Dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OLLAMA AI ANALYSIS
+# AI ANALYSIS  —  Claude primary · Ollama fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ai_analysis(c: dict) -> str:
-    """Send all signals to local Ollama model for qualitative verdict."""
-    if not HAS_OLLAMA:
-        return "ollama not installed — pip install ollama"
+# System prompt is stable across all calls — cached by the API after the first hit.
+_SYSTEM_PROMPT = """\
+You are a quantitative trading analyst specialising in pre-earnings options strategies.
+Your job: evaluate whether a setup warrants buying put options before the earnings print.
 
+Strategy thesis: stocks that ran up hard into earnings often "sell the news" — especially
+when guided by IV crush, crowded longs, and proximity to 52-week highs.
+Key risks: surprise beat, short squeeze, and IV crush overwhelming any price drop.
+
+Respond ONLY in this exact format — no extra text, no preamble:
+VERDICT: BUY PUTS | SKIP | WEAK
+KEY REASON: <one sentence, specific to the numbers>
+MAIN RISK: <one sentence, specific to the setup>
+NOTE: <one stock-specific observation about this ticker's earnings history or sector>\
+"""
+
+
+def _build_user_message(c: dict) -> str:
     r  = c["runup"]
     iv = c["iv"]
     m  = c["mkt"]
+    return f"""\
+TICKER: {c['sym']}
+Earnings: {c['edate'].strftime('%Y-%m-%d')} ({c['days']} days away)
+Price: ${c['price']}  |  Score: {c['score']}/100
 
-    prompt = f"""You are a quantitative trading analyst. Evaluate this pre-earnings put option trade.
-Be concise — 4 sentences max. No filler.
+PRICE ACTION
+  Run-up  5d: {r['r5d']:+.1f}%   10d: {r['r10d']:+.1f}%   20d: {r['r20d']:+.1f}%
+  Distance from 52w high: {r['dist_52h']:+.1f}%
+  Volume surge: {c['vsurge']:.1f}x 20d average
 
-TICKER: {c['sym']} | Earnings: {c['edate'].strftime('%Y-%m-%d')} ({c['days']} days) | Price: ${c['price']}
+OPTIONS
+  ATM put IV: {iv.get('atm_iv', 0):.0f}%
+  Market-priced expected move: +/-{iv.get('exp_move', 0):.1f}%
 
-SIGNALS:
-- Run-up:  5d={r['r5d']:+.1f}%  10d={r['r10d']:+.1f}%  20d={r['r20d']:+.1f}%
-- From 52w high: {r['dist_52h']:+.1f}%
-- Volume surge: {c['vsurge']:.1f}x 20-day avg
-- ATM Put IV: {iv.get('atm_iv', 0):.0f}% | Market-priced expected move: +/-{iv.get('exp_move', 0):.1f}%
-- ATR (14): ${c['atr']} | ATR stop ref: ${c['stop']}
-- SPY 5d: {m['spy_5d']:+.1f}% | Regime: {m['regime']}
-- Setup score: {c['score']}/100
+TECHNICALS
+  ATR(14): ${c['atr']}   |   ATR-stop ref: ${c['stop']}
 
-STRATEGY: Buy puts before earnings when stock ran up on hype. Profit from "sell the news" / guidance miss.
-Risk: IV crush after print, surprise beat, short squeeze.
+MARKET
+  SPY 5d: {m['spy_5d']:+.1f}%   |   Regime: {m['regime']}   |   Above MA20: {m['above_ma20']}
 
-Format your response exactly as:
-VERDICT: BUY PUTS / SKIP / WEAK
-KEY REASON: <1 sentence>
-MAIN RISK: <1 sentence>
-NOTE: <1 stock-specific observation>"""
+Evaluate this setup.\
+"""
 
-    try:
-        resp = ollama.chat(
-            model=CFG["OLLAMA_MODEL"],
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp["message"]["content"]
-    except Exception as e:
-        return f"Ollama error: {e}"
+
+def _ai_via_claude(c: dict) -> str:
+    """Call Claude API with cached system prompt. Returns formatted verdict string."""
+    client = _anthropic.Anthropic(api_key=CFG["ANTHROPIC_API_KEY"])
+    msg = client.messages.create(
+        model=CFG["CLAUDE_MODEL"],
+        max_tokens=256,
+        system=[
+            {
+                "type": "text",
+                "text": _SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},   # cache across scans
+            }
+        ],
+        messages=[{"role": "user", "content": _build_user_message(c)}],
+    )
+    return msg.content[0].text.strip()
+
+
+def _ai_via_ollama(c: dict) -> str:
+    """Fallback: local Ollama model. Same prompt, no caching."""
+    prompt = _SYSTEM_PROMPT + "\n\n" + _build_user_message(c)
+    resp = ollama.chat(
+        model=CFG["OLLAMA_MODEL"],
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp["message"]["content"].strip()
+
+
+def ai_analysis(c: dict) -> str:
+    """
+    Return AI verdict for a candidate setup.
+
+    Priority:
+      1. Claude API  (if ANTHROPIC_API_KEY is set)
+      2. Ollama      (if installed and running locally)
+      3. Plain text  (signals only, no LLM)
+    """
+    # ── Claude (preferred) ────────────────────────────────────────────────────
+    if HAS_CLAUDE and CFG["ANTHROPIC_API_KEY"]:
+        try:
+            return _ai_via_claude(c)
+        except Exception as e:
+            cprint(f"  [yellow]Claude API error ({e}) — falling back to Ollama[/yellow]")
+
+    # ── Ollama (fallback) ─────────────────────────────────────────────────────
+    if HAS_OLLAMA:
+        try:
+            return _ai_via_ollama(c)
+        except Exception as e:
+            cprint(f"  [yellow]Ollama error ({e}) — no AI verdict available[/yellow]")
+
+    # ── No LLM available ─────────────────────────────────────────────────────
+    r  = c["runup"]
+    iv = c["iv"]
+    return (
+        f"VERDICT: WEAK  (no AI backend — set ANTHROPIC_API_KEY or start Ollama)\n"
+        f"KEY REASON: Score {c['score']}/100 | IV {iv.get('atm_iv',0):.0f}% | "
+        f"dist_52h {r['dist_52h']:+.1f}%\n"
+        f"MAIN RISK: Cannot assess without AI verdict.\n"
+        f"NOTE: Run: export ANTHROPIC_API_KEY=your_key"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -625,9 +706,15 @@ def log_trade(c: dict, put: dict, order: Optional[dict], verdict: str):
 
 def main():
     mode_label = "[yellow]PAPER[/yellow]" if CFG["PAPER"] else "[red bold]LIVE[/red bold]"
+    if HAS_CLAUDE and CFG["ANTHROPIC_API_KEY"]:
+        ai_label = f"Claude ({CFG['CLAUDE_MODEL']})"
+    elif HAS_OLLAMA:
+        ai_label = f"Ollama ({CFG['OLLAMA_MODEL']})"
+    else:
+        ai_label = "no AI"
     cprint(f"\n[bold cyan]Earnings Short Bot[/bold cyan]  |  "
            f"Mode: {mode_label}  |  "
-           f"Model: {CFG['OLLAMA_MODEL']}  |  "
+           f"AI: {ai_label}  |  "
            f"Max spend: ${CFG['MAX_SPEND']}")
 
     cprint("\n[1] Scan + Trade   [2] Monitor positions   [3] Custom tickers")
